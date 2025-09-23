@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Garmin Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1rem; }
+    header { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; margin-bottom: 1rem; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 1.5rem; }
+    @media (min-width: 960px) { .row { grid-template-columns: 1fr 1fr; } }
+    .card { padding: 1rem; border: 1px solid #ddd; border-radius: 8px; }
+    label { margin-right: .25rem; }
+    .controls { display: flex; gap: .75rem; align-items: center; }
+    .seg { display: inline-flex; border: 1px solid #bbb; border-radius: 6px; overflow: hidden; }
+    .seg button { border: 0; background: #f6f6f6; padding: .4rem .6rem; cursor: pointer; }
+    .seg button.active { background: #333; color: #fff; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/luxon@3"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
+</head>
+<body>
+  <h1>Garmin Dashboard</h1>
+  <header>
+    <div class="controls">
+      <label for="from">From</label>
+      <input type="date" id="from" />
+      <label for="to">To</label>
+      <input type="date" id="to" />
+    </div>
+    <div class="controls">
+      <span>Bucket:</span>
+      <div class="seg" id="bucket">
+        <button data-b="day" class="active">Day</button>
+        <button data-b="week">Week</button>
+        <button data-b="month">Month</button>
+      </div>
+      <button id="resetRange" title="Reset date range">Reset</button>
+    </div>
+  </header>
+  <div id="loader" style="position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(255,255,255,0.6);backdrop-filter:saturate(0.5) blur(2px);z-index:9999">
+    <div style="padding:.75rem 1rem;border:1px solid #ddd;border-radius:8px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.1);font-weight:600">Updating charts…</div>
+  </div>
+  <div class="row">
+    <div class="card"><h3>Average Sleep (hours)</h3><canvas id="sleepChart"></canvas></div>
+    <div class="card"><h3>Average Stress</h3><canvas id="stressChart"></canvas></div>
+    <div class="card"><h3>Average BPM</h3><canvas id="hrChart"></canvas></div>
+  </div>
+
+  <script>
+    const TZ = 'Europe/Paris';
+    const DateTime = luxon.DateTime;
+    // Register plugins explicitly
+    if (window['chartjs-plugin-annotation']) Chart.register(window['chartjs-plugin-annotation']);
+    if (window['chartjs-plugin-zoom']) Chart.register(window['chartjs-plugin-zoom']);
+
+    function parseISOZ(s) { return DateTime.fromISO(s, { zone: 'utc' }); }
+
+    function bucketKey(dt, bucket) {
+      const l = dt.setZone(TZ);
+      if (bucket === 'day') return l.toFormat('yyyy-LL-dd');
+      if (bucket === 'week') {
+        // ISO week, Monday as first day
+        const weekStart = l.startOf('week');
+        return weekStart.toFormat('kkkk-\'W\'WW');
+      }
+      if (bucket === 'month') return l.toFormat('yyyy-LL');
+      return l.toFormat('yyyy-LL-dd');
+    }
+
+    function toDayKey(dt) { return dt.setZone(TZ).toFormat('yyyy-LL-dd'); }
+
+    function aggregate(data, from, to, bucket) {
+      // Use precomputed daily series; bucket to day/week/month with fast grouping
+      const fromDT = from ? DateTime.fromISO(from, { zone: TZ }).startOf('day') : null;
+      const toDT = to ? DateTime.fromISO(to, { zone: TZ }).endOf('day') : null;
+      const daily = data.daily || { hr: [], stress: [], sleep: [] };
+
+      const aggDaily = (arr, valueKey) => {
+        const map = new Map();
+        for (const row of arr) {
+          const dt = DateTime.fromFormat(row.day, 'yyyy-LL-dd', { zone: TZ });
+          if (fromDT && dt < fromDT) continue;
+          if (toDT && dt > toDT) continue;
+          const k = bucketKey(dt, bucket);
+          const e = map.get(k) || { sum: 0, n: 0 };
+          const v = row[valueKey];
+          if (typeof v === 'number') {
+            e.sum += v; e.n += 1;
+          }
+          map.set(k, e);
+        }
+        const pts = [...map.entries()].map(([k, v]) => ({ x: keyToCenterTS(k, bucket), y: v.n ? v.sum / v.n : null }));
+        pts.sort((a, b) => a.x - b.x);
+        return pts;
+      };
+
+      return {
+        hr: aggDaily(daily.hr, 'avg'),
+        stress: aggDaily(daily.stress, 'avg'),
+        sleep: aggDaily(daily.sleep, 'hours'),
+      };
+    }
+
+    function buildAnnotations(spans, from, to, color) {
+      const anns = {};
+      if (!spans) return anns;
+      const fromDT = from ? DateTime.fromISO(from, { zone: TZ }).startOf('day') : null;
+      const toDT = to ? DateTime.fromISO(to, { zone: TZ }).endOf('day') : null;
+      let idx = 0;
+      for (const s of spans) {
+        const a = DateTime.fromFormat(s.from, 'yyyy-LL-dd', { zone: TZ }).startOf('day');
+        const b = DateTime.fromFormat(s.to, 'yyyy-LL-dd', { zone: TZ }).endOf('day');
+        // Intersect with current window
+        const xMin = fromDT && a < fromDT ? fromDT : a;
+        const xMax = toDT && b > toDT ? toDT : b;
+        if (xMax < xMin) continue;
+        anns['miss_'+(idx++)] = {
+          type: 'box',
+          xMin: xMin.toJSDate(),
+          xMax: xMax.toJSDate(),
+          backgroundColor: color,
+          borderWidth: 0,
+        };
+      }
+      return anns;
+    }
+
+    function keyToCenterTS(k, bucket) {
+      if (bucket === 'day') return DateTime.fromFormat(k, 'yyyy-LL-dd', { zone: TZ }).plus({ hours: 12 }).toJSDate();
+      if (bucket === 'week') {
+        const dt = DateTime.fromFormat(k, "kkkk-'W'WW", { zone: TZ }).startOf('week');
+        return dt.plus({ days: 3 }).toJSDate(); // mid-week
+      }
+      if (bucket === 'month') return DateTime.fromFormat(k, 'yyyy-LL', { zone: TZ }).plus({ days: 14 }).toJSDate();
+      return DateTime.now().toJSDate();
+    }
+
+    async function loadData() {
+      const resp = await fetch('data.json');
+      if (!resp.ok) throw new Error('Failed to load data.json');
+      return await resp.json();
+    }
+
+    function newLineChart(ctx, label, color) {
+      return new Chart(ctx, {
+        type: 'line',
+        data: { datasets: [{
+          label,
+          data: [],
+          borderColor: color,
+          backgroundColor: color,
+          pointRadius: 2.5,
+          pointHoverRadius: 6,
+          pointHitRadius: 10,
+          pointBorderColor: '#fff',
+          pointBorderWidth: 1,
+          tension: 0.2,
+        }] },
+        options: {
+          responsive: true,
+          interaction: { mode: 'nearest', intersect: true },
+          scales: {
+            x: { type: 'time', time: { unit: 'day' } },
+            y: { beginAtZero: true }
+          },
+          elements: { point: { radius: 2.5, hoverRadius: 6, hitRadius: 10 } },
+          plugins: {
+            legend: { display: false },
+            annotation: { annotations: {} },
+            zoom: {
+              zoom: {
+                drag: { enabled: true, backgroundColor: 'rgba(0,0,0,0.05)', borderColor: '#888' },
+                mode: 'x',
+                onZoomComplete: ({chart}) => onZoomApplied(chart)
+              },
+              pan: { enabled: false }
+            },
+            decimation: { enabled: true, algorithm: 'min-max' }
+          }
+        }
+      });
+    }
+
+    (async () => {
+      const data = await loadData();
+      const sleepChart = newLineChart(document.getElementById('sleepChart'), 'Sleep (hours)', '#3b82f6');
+      const stressChart = newLineChart(document.getElementById('stressChart'), 'Stress', '#ef4444');
+      const hrChart = newLineChart(document.getElementById('hrChart'), 'HR (bpm)', '#10b981');
+
+      // Default range based on precomputed daily coverage (union of series)
+      const daily = data.daily || { hr: [], stress: [], sleep: [] };
+      const dailyDates = [
+        ...daily.hr.map(r => DateTime.fromFormat(r.day, 'yyyy-LL-dd', { zone: TZ })),
+        ...daily.stress.map(r => DateTime.fromFormat(r.day, 'yyyy-LL-dd', { zone: TZ })),
+        ...daily.sleep.map(r => DateTime.fromFormat(r.day, 'yyyy-LL-dd', { zone: TZ })),
+      ];
+      const allTs = dailyDates.length ? dailyDates : [
+        ...data.hr_samples.map(s => parseISOZ(s.ts)),
+        ...data.stress_samples.map(s => parseISOZ(s.ts)),
+        ...data.sleep_sessions.flatMap(s => [s.start && parseISOZ(s.start), s.end && parseISOZ(s.end)].filter(Boolean)),
+      ];
+      const minTs = allTs.length ? DateTime.min(...allTs) : DateTime.now().minus({ months: 1 });
+      const maxTs = allTs.length ? DateTime.max(...allTs) : DateTime.now();
+      const defaultFrom = minTs.setZone(TZ).toFormat('yyyy-LL-dd');
+      const defaultTo = maxTs.setZone(TZ).toFormat('yyyy-LL-dd');
+      document.getElementById('from').value = defaultFrom;
+      document.getElementById('to').value = defaultTo;
+
+      let bucket = 'day';
+
+      function setLoading(isLoading) {
+        const loader = document.getElementById('loader');
+        loader.style.display = isLoading ? 'flex' : 'none';
+        for (const el of document.querySelectorAll('input,button')) el.disabled = isLoading;
+      }
+
+      let refreshTimer = null;
+      function refresh() {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        setLoading(true);
+        refreshTimer = setTimeout(() => {
+        const from = document.getElementById('from').value || null;
+        const to = document.getElementById('to').value || null;
+        const agg = aggregate(data, from, to, bucket);
+        sleepChart.data.datasets[0].data = agg.sleep;
+        stressChart.data.datasets[0].data = agg.stress;
+        hrChart.data.datasets[0].data = agg.hr;
+        // Missing annotations per chart
+        hrChart.options.plugins.annotation.annotations = buildAnnotations(data.missing_spans?.hr, from, to, 'rgba(16,185,129,0.08)');
+        stressChart.options.plugins.annotation.annotations = buildAnnotations(data.missing_spans?.stress, from, to, 'rgba(239,68,68,0.08)');
+        sleepChart.options.plugins.annotation.annotations = buildAnnotations(data.missing_spans?.sleep, from, to, 'rgba(59,130,246,0.08)');
+        sleepChart.update();
+        stressChart.update();
+        hrChart.update();
+        setLoading(false);
+        refreshTimer = null;
+        }, 50);
+      }
+
+      document.getElementById('from').addEventListener('change', refresh);
+      document.getElementById('to').addEventListener('change', refresh);
+      document.getElementById('resetRange').addEventListener('click', () => {
+        document.getElementById('from').value = defaultFrom;
+        document.getElementById('to').value = defaultTo;
+        refresh();
+        // Also reset any zoom transforms so axes auto-scale to the new data
+        if (sleepChart.resetZoom) sleepChart.resetZoom();
+        if (stressChart.resetZoom) stressChart.resetZoom();
+        if (hrChart.resetZoom) hrChart.resetZoom();
+      });
+      document.getElementById('bucket').addEventListener('click', (e) => {
+        const b = e.target?.dataset?.b; if (!b) return;
+        bucket = b;
+        for (const btn of e.currentTarget.querySelectorAll('button')) btn.classList.toggle('active', btn.dataset.b === b);
+        refresh();
+      });
+
+      refresh();
+    })().catch(err => {
+      console.error(err);
+      alert('Failed to initialize dashboard: ' + err.message);
+    });
+
+    function onZoomApplied(chart) {
+      const scale = chart.scales.x;
+      if (!scale) return;
+      const from = DateTime.fromMillis(scale.min, { zone: TZ }).toFormat('yyyy-LL-dd');
+      const to = DateTime.fromMillis(scale.max, { zone: TZ }).toFormat('yyyy-LL-dd');
+      document.getElementById('from').value = from;
+      document.getElementById('to').value = to;
+      // Let data filtering drive the scale
+      const refreshNow = () => {
+        const evt = new Event('change');
+        document.getElementById('from').dispatchEvent(evt);
+      };
+      refreshNow();
+      setTimeout(() => { if (chart.resetZoom) chart.resetZoom(); }, 0);
+    }
+  </script>
+</body>
+</html>
+

@@ -2,11 +2,12 @@
 import argparse
 import json
 import os
+import shutil
 import sys
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 try:
     from fitparse import FitFile
@@ -25,18 +26,42 @@ PARIS_TZ = ZoneInfo("Europe/Paris")
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Aggregate Garmin watch snapshots into JSON and report missing days.")
-    p.add_argument("--input", "-i", type=Path, default=Path.home() / "Data" / "smart_watch",
-                   help="Path to the snapshots root directory (default: ~/Data/smart_watch)")
-    p.add_argument("--out", "-o", type=Path, default=Path("dist"),
-                   help="Output directory for dist files (default: dist)")
-    p.add_argument("--tz", type=str, default="Europe/Paris", help="IANA timezone name for bucketing (default: Europe/Paris)")
-    p.add_argument("--limit", type=int, default=0, help="For debugging: limit number of FIT files per category")
+    p = argparse.ArgumentParser(
+        description="Aggregate Garmin watch snapshots into JSON and report missing days."
+    )
+    p.add_argument(
+        "--input",
+        "-i",
+        type=Path,
+        default=Path.home() / "Data" / "smart_watch",
+        help="Path to the snapshots root directory (default: ~/Data/smart_watch)",
+    )
+    p.add_argument(
+        "--out",
+        "-o",
+        type=Path,
+        default=Path("dist"),
+        help="Output directory for dist files (default: dist)",
+    )
+    p.add_argument(
+        "--tz",
+        type=str,
+        default="Europe/Paris",
+        help="IANA timezone name for bucketing (default: Europe/Paris)",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="For debugging: limit number of FIT files per category",
+    )
     return p.parse_args(argv)
 
 
 def is_snapshot_dir(path: Path) -> bool:
-    return path.is_dir() and any((path / sub).exists() for sub in ("Sleep", "Monitor", "Metrics"))
+    return path.is_dir() and any(
+        (path / sub).exists() for sub in ("Sleep", "Monitor", "Metrics")
+    )
 
 
 def list_snapshot_dirs(root: Path) -> List[Path]:
@@ -111,7 +136,9 @@ def ensure_dt(dt: Any) -> Optional[datetime]:
     return None
 
 
-def _reconstruct_ts16(last_full: Optional[datetime], ts16_val: Any) -> Optional[datetime]:
+def _reconstruct_ts16(
+    last_full: Optional[datetime], ts16_val: Any
+) -> Optional[datetime]:
     # If ts16 is already datetime, use it
     if isinstance(ts16_val, datetime):
         return ensure_dt(ts16_val)
@@ -131,7 +158,9 @@ def _reconstruct_ts16(last_full: Optional[datetime], ts16_val: Any) -> Optional[
     return datetime.fromtimestamp(candidate, tz=timezone.utc)
 
 
-def extract_monitoring_metrics_from_iter(messages) -> Tuple[List[Tuple[datetime, int]], List[Tuple[datetime, int]]]:
+def extract_monitoring_metrics_from_iter(
+    messages,
+) -> Tuple[List[Tuple[datetime, int]], List[Tuple[datetime, int]]]:
     """Return (hr_samples, stress_samples) as lists of (utc_dt, value)."""
     hr: List[Tuple[datetime, int]] = []
     stress: List[Tuple[datetime, int]] = []
@@ -178,12 +207,16 @@ def extract_monitoring_metrics_from_iter(messages) -> Tuple[List[Tuple[datetime,
     return hr, stress
 
 
-def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]:
+def extract_sleep_sessions_from_iter(
+    messages,
+) -> List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]:
     """Return list of sleep sessions as (start_utc, end_utc, duration_sec).
 
     Tries multiple heuristics since FIT sleep schemas vary by device/firmware.
     """
-    sessions: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]] = []
+    sessions: List[
+        Tuple[Optional[datetime], Optional[datetime], Optional[int]]
+    ] = []
     totals: List[int] = []
     starts: List[datetime] = []
     ends: List[datetime] = []
@@ -193,11 +226,19 @@ def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime],
         for name, fields in messages:
             # Common summary message
             if name in ("sleep_summary", "sleep"):
-                dur = fields.get("total_sleep_time") or fields.get("total_sleep_duration") or fields.get("sleep_time")
+                dur = (
+                    fields.get("total_sleep_time")
+                    or fields.get("total_sleep_duration")
+                    or fields.get("sleep_time")
+                )
                 if isinstance(dur, int) and dur > 0:
                     totals.append(dur)
-                st = ensure_dt(fields.get("start_time")) or ensure_dt(fields.get("sleep_start_time"))
-                en = ensure_dt(fields.get("end_time")) or ensure_dt(fields.get("sleep_end_time"))
+                st = ensure_dt(fields.get("start_time")) or ensure_dt(
+                    fields.get("sleep_start_time")
+                )
+                en = ensure_dt(fields.get("end_time")) or ensure_dt(
+                    fields.get("sleep_end_time")
+                )
                 if st is not None:
                     starts.append(st)
                 if en is not None:
@@ -216,7 +257,13 @@ def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime],
                             pending_start = ts
                         elif etype == "stop" and pending_start is not None:
                             if ts > pending_start:
-                                sessions.append((pending_start, ts, int((ts - pending_start).total_seconds())))
+                                sessions.append(
+                                    (
+                                        pending_start,
+                                        ts,
+                                        int((ts - pending_start).total_seconds()),
+                                    )
+                                )
                             pending_start = None
 
             # Sleep level timeline (derive sessions)
@@ -226,7 +273,13 @@ def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime],
                 if ts is not None and isinstance(lvl, int):
                     timeline.append((ts, lvl))
             # Some devices expose intervals with duration
-            for dur_key in ("duration", "total_sleep", "light_sleep_time", "deep_sleep_time", "rem_sleep_time"):
+            for dur_key in (
+                "duration",
+                "total_sleep",
+                "light_sleep_time",
+                "deep_sleep_time",
+                "rem_sleep_time",
+            ):
                 v = fields.get(dur_key)
                 if isinstance(v, int) and v > 0:
                     totals.append(int(v))
@@ -257,8 +310,12 @@ def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime],
     return sessions
 
 
-def _build_sleep_sessions_from_timeline(timeline: List[Tuple[datetime, int]]) -> List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]:
-    sessions: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]] = []
+def _build_sleep_sessions_from_timeline(
+    timeline: List[Tuple[datetime, int]]
+) -> List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]:
+    sessions: List[
+        Tuple[Optional[datetime], Optional[datetime], Optional[int]]
+    ] = []
     if not timeline:
         return sessions
     timeline.sort(key=lambda x: x[0])
@@ -267,9 +324,17 @@ def _build_sleep_sessions_from_timeline(timeline: List[Tuple[datetime, int]]) ->
     last_ts: Optional[datetime] = None
     for ts, lvl in timeline:
         if in_sleep:
-            if last_ts and (ts - last_ts).total_seconds() > 60 * 30:  # 30+ min gap ends session
+            if (
+                last_ts and (ts - last_ts).total_seconds() > 60 * 30
+            ):  # 30+ min gap ends session
                 if cur_start and last_ts and last_ts > cur_start:
-                    sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
+                    sessions.append(
+                        (
+                            cur_start,
+                            last_ts,
+                            int((last_ts - cur_start).total_seconds()),
+                        )
+                    )
                 in_sleep = False
                 cur_start = None
         if isinstance(lvl, int) and lvl >= 1:
@@ -279,12 +344,20 @@ def _build_sleep_sessions_from_timeline(timeline: List[Tuple[datetime, int]]) ->
         else:
             if in_sleep:
                 if cur_start and last_ts and last_ts > cur_start:
-                    sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
+                    sessions.append(
+                        (
+                            cur_start,
+                            last_ts,
+                            int((last_ts - cur_start).total_seconds()),
+                        )
+                    )
                 in_sleep = False
                 cur_start = None
         last_ts = ts
     if in_sleep and cur_start and last_ts and last_ts > cur_start:
-        sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
+        sessions.append(
+            (cur_start, last_ts, int((last_ts - cur_start).total_seconds()))
+        )
     return sessions
 
 
@@ -299,7 +372,9 @@ def _extract_sleep_timeline_from_iter(messages) -> List[Tuple[datetime, int]]:
                 if isinstance(raw, int):
                     lvl_val = raw
                 elif isinstance(raw, str):
-                    lvl_val = 0 if raw.lower() == "awake" else 1  # treat non-awake as sleep
+                    lvl_val = (
+                        0 if raw.lower() == "awake" else 1
+                    )  # treat non-awake as sleep
                 if ts is not None and isinstance(lvl_val, int):
                     timeline.append((ts, lvl_val))
     except Exception:
@@ -307,30 +382,43 @@ def _extract_sleep_timeline_from_iter(messages) -> List[Tuple[datetime, int]]:
     return timeline
 
 
-def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, int]], List[Tuple[datetime, int]], List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]]:
+def parse_snapshots(root: Path, limit: int = 0) -> Tuple[
+    List[Tuple[datetime, int]],
+    List[Tuple[datetime, int]],
+    List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]],
+]:
     hr_all: List[Tuple[datetime, int]] = []
     stress_all: List[Tuple[datetime, int]] = []
-    sleep_all: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]] = []
+    sleep_all: List[
+        Tuple[Optional[datetime], Optional[datetime], Optional[int]]
+    ] = []
     sleep_timeline: List[Tuple[datetime, int]] = []
 
     snaps = list_snapshot_dirs(root)
     print(f"Found {len(snaps)} snapshot(s) in {root}", flush=True)
     for snap in snaps:
         print(f"Snapshot {snap.name}", flush=True)
+
         def iter_with_progress(files: List[Path], label: str):
             total = len(files)
             if total == 0:
                 return
-            print(f"  {label}: {total} file(s){' (limited)' if limit and total>limit else ''}", flush=True)
+            print(
+                f"  {label}: {total} file(s){' (limited)' if limit and total>limit else ''}",
+                flush=True,
+            )
             step = max(total // 10, 1)
             for i, f in enumerate(files, start=1):
                 yield i, total, f
                 if i % step == 0 or i == total:
                     print(f"  {label}: {i}/{total}", flush=True)
+
         # Monitor → HR & stress
         mon_dir = snap / "Monitor"
         if mon_dir.exists():
-            files = sorted([p for p in mon_dir.iterdir() if p.suffix.lower() == ".fit"])
+            files = sorted(
+                [p for p in mon_dir.iterdir() if p.suffix.lower() == ".fit"]
+            )
             if limit:
                 files = files[:limit]
             for i, total, f in iter_with_progress(files, "Monitor"):
@@ -342,7 +430,9 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
         # Sleep → sessions
         sl_dir = snap / "Sleep"
         if sl_dir.exists():
-            files = sorted([p for p in sl_dir.iterdir() if p.suffix.lower() == ".fit"])
+            files = sorted(
+                [p for p in sl_dir.iterdir() if p.suffix.lower() == ".fit"]
+            )
             if limit:
                 files = files[:limit]
             for i, total, f in iter_with_progress(files, "Sleep"):
@@ -356,7 +446,9 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
         # Metrics → sometimes contains sleep summary and stress
         met_dir = snap / "Metrics"
         if met_dir.exists():
-            files = sorted([p for p in met_dir.iterdir() if p.suffix.lower() == ".fit"])
+            files = sorted(
+                [p for p in met_dir.iterdir() if p.suffix.lower() == ".fit"]
+            )
             if limit:
                 files = files[:limit]
             for i, total, f in iter_with_progress(files, "Metrics"):
@@ -376,12 +468,17 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
         print(f"  Done {snap.name}", flush=True)
 
     # Deduplicate by timestamp for hr and stress
-    def dedup_time_series(series: List[Tuple[datetime, int]]) -> List[Tuple[datetime, int]]:
+    def dedup_time_series(
+        series: List[Tuple[datetime, int]]
+    ) -> List[Tuple[datetime, int]]:
         seen: Dict[int, int] = {}
         for ts, val in series:
             key = int(ts.replace(tzinfo=timezone.utc).timestamp())
             seen[key] = val  # last wins
-        out = [(datetime.fromtimestamp(k, tz=timezone.utc), v) for k, v in seen.items()]
+        out = [
+            (datetime.fromtimestamp(k, tz=timezone.utc), v)
+            for k, v in seen.items()
+        ]
         out.sort(key=lambda x: x[0])
         return out
 
@@ -393,11 +490,17 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
         sleep_all.extend(_build_sleep_sessions_from_timeline(sleep_timeline))
 
     # Merge overlapping/adjacent sessions to avoid double-counting across files/snapshots
-    def merge_sessions(sessions: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]) -> List[Tuple[datetime, datetime, int]]:
+    def merge_sessions(
+        sessions: List[
+            Tuple[Optional[datetime], Optional[datetime], Optional[int]]
+        ]
+    ) -> List[Tuple[datetime, datetime, int]]:
         items: List[Tuple[datetime, datetime]] = []
         for st, en, _ in sessions:
             if isinstance(st, datetime) and isinstance(en, datetime) and en > st:
-                items.append((st.astimezone(timezone.utc), en.astimezone(timezone.utc)))
+                items.append(
+                    (st.astimezone(timezone.utc), en.astimezone(timezone.utc))
+                )
         if not items:
             return []
         items.sort(key=lambda x: x[0])
@@ -416,7 +519,10 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
 
     # Merge duplicates and overlaps
     merged_sleep = merge_sessions(sleep_all)
-    print(f"Parsed: HR samples={len(hr_all)}, Stress samples={len(stress_all)}, Sleep sessions={len(merged_sleep)} (timeline points={len(sleep_timeline)})", flush=True)
+    print(
+        f"Parsed: HR samples={len(hr_all)}, Stress samples={len(stress_all)}, Sleep sessions={len(merged_sleep)} (timeline points={len(sleep_timeline)})",
+        flush=True,
+    )
     return hr_all, stress_all, merged_sleep
 
 
@@ -424,14 +530,15 @@ def to_iso(ts: datetime) -> str:
     return ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def json_payload(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, int]],
-                 sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]],
-                 missing_spans: Dict[str, List[Dict[str, str]]],
-                 daily: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+def json_payload(
+    hr: List[Tuple[datetime, int]],
+    stress: List[Tuple[datetime, int]],
+    sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]],
+    missing_spans: Dict[str, List[Dict[str, str]]],
+    daily: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
     return {
-        "hr_samples": [
-            {"ts": to_iso(ts), "hr": val} for ts, val in hr
-        ],
+        "hr_samples": [{"ts": to_iso(ts), "hr": val} for ts, val in hr],
         "stress_samples": [
             {"ts": to_iso(ts), "stress": val} for ts, val in stress
         ],
@@ -465,9 +572,14 @@ def local_day_bounds(dt: datetime, tz: ZoneInfo) -> Tuple[datetime, datetime]:
     local = dt.astimezone(tz)
     start_local = datetime(local.year, local.month, local.day, tzinfo=tz)
     end_local = start_local + timedelta(days=1)
-    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(
+        timezone.utc
+    )
 
-def _group_missing_days(day_set: set, start_local: datetime, end_local: datetime) -> List[Tuple[str, str]]:
+
+def _group_missing_days(
+    day_set: set, start_local: datetime, end_local: datetime
+) -> List[Tuple[str, str]]:
     spans: List[Tuple[str, str]] = []
     cur_start: Optional[datetime] = None
     cur_end: Optional[datetime] = None
@@ -483,17 +595,25 @@ def _group_missing_days(day_set: set, start_local: datetime, end_local: datetime
                 cur_end = d
         else:
             if cur_start is not None and cur_end is not None:
-                spans.append((cur_start.strftime("%Y-%m-%d"), cur_end.strftime("%Y-%m-%d")))
+                spans.append(
+                    (cur_start.strftime("%Y-%m-%d"), cur_end.strftime("%Y-%m-%d"))
+                )
                 cur_start = None
                 cur_end = None
         d = d + timedelta(days=1)
     if cur_start is not None and cur_end is not None:
-        spans.append((cur_start.strftime("%Y-%m-%d"), cur_end.strftime("%Y-%m-%d")))
+        spans.append(
+            (cur_start.strftime("%Y-%m-%d"), cur_end.strftime("%Y-%m-%d"))
+        )
     return spans
 
 
-def compute_missing(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, int]],
-                    sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]], tz_name: str) -> Tuple[str, Dict[str, List[Dict[str, str]]]]:
+def compute_missing(
+    hr: List[Tuple[datetime, int]],
+    stress: List[Tuple[datetime, int]],
+    sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]],
+    tz_name: str,
+) -> Tuple[str, Dict[str, List[Dict[str, str]]]]:
     tz = ZoneInfo(tz_name)
 
     # Build day sets
@@ -513,16 +633,28 @@ def compute_missing(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime,
         min_dt = min(min_dt, stress[0][0])
         max_dt = max(max_dt, stress[-1][0])
     if sleep:
-        s_times = [st for st, _, _ in sleep if isinstance(st, datetime)] + [en for _, en, _ in sleep if isinstance(en, datetime)]
+        s_times = [st for st, _, _ in sleep if isinstance(st, datetime)] + [
+            en for _, en, _ in sleep if isinstance(en, datetime)
+        ]
         if s_times:
             min_dt = min(min_dt, min(s_times))
             max_dt = max(max_dt, max(s_times))
 
     start_local = datetime.fromtimestamp(0, tz)  # placeholder, replaced below
     start_utc_localized = min_dt.astimezone(tz)
-    start_local = datetime(start_utc_localized.year, start_utc_localized.month, start_utc_localized.day, tzinfo=tz)
+    start_local = datetime(
+        start_utc_localized.year,
+        start_utc_localized.month,
+        start_utc_localized.day,
+        tzinfo=tz,
+    )
     end_utc_localized = max_dt.astimezone(tz)
-    end_local = datetime(end_utc_localized.year, end_utc_localized.month, end_utc_localized.day, tzinfo=tz)
+    end_local = datetime(
+        end_utc_localized.year,
+        end_utc_localized.month,
+        end_utc_localized.day,
+        tzinfo=tz,
+    )
 
     # Build presence sets
     hr_days = {day_key(ts) for ts, _ in hr}
@@ -556,8 +688,12 @@ def compute_missing(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime,
     return "\n".join(lines), spans_json
 
 
-def compute_daily(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, int]],
-                  sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]], tz_name: str) -> Dict[str, List[Dict[str, Any]]]:
+def compute_daily(
+    hr: List[Tuple[datetime, int]],
+    stress: List[Tuple[datetime, int]],
+    sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]],
+    tz_name: str,
+) -> Dict[str, List[Dict[str, Any]]]:
     tz = ZoneInfo(tz_name)
 
     def day_str(dt: datetime) -> str:
@@ -575,8 +711,13 @@ def compute_daily(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, i
         s, c = stress_acc.get(d, (0, 0))
         stress_acc[d] = (s + val, c + 1)
 
-    hr_daily = [{"day": d, "avg": (s / c) if c else None} for d, (s, c) in hr_acc.items()]
-    stress_daily = [{"day": d, "avg": (s / c) if c else None} for d, (s, c) in stress_acc.items()]
+    hr_daily = [
+        {"day": d, "avg": (s / c) if c else None} for d, (s, c) in hr_acc.items()
+    ]
+    stress_daily = [
+        {"day": d, "avg": (s / c) if c else None}
+        for d, (s, c) in stress_acc.items()
+    ]
     hr_daily.sort(key=lambda x: x["day"])
     stress_daily.sort(key=lambda x: x["day"])
 
@@ -600,7 +741,9 @@ def compute_daily(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, i
             # Duration without timestamps; cannot attribute to a day, skip
             pass
 
-    sleep_daily = [{"day": d, "hours": mins / 60.0} for d, mins in sleep_min.items()]
+    sleep_daily = [
+        {"day": d, "hours": mins / 60.0} for d, mins in sleep_min.items()
+    ]
     sleep_daily.sort(key=lambda x: x["day"])
 
     return {
@@ -637,236 +780,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         print("No missing days detected in parsed series.")
 
-    # Write minimal index.html if not present (optional convenience)
+    # Copy default index.html from templates if not present (optional convenience)
     index_path = args.out / "index.html"
     if not index_path.exists():
-        index_path.write_text(_DEFAULT_INDEX_HTML, encoding="utf-8")
+        template_candidates = [
+            Path(__file__).parent / "templates" / "index.html",
+            Path(__file__).parent / "dist" / "index.html",
+        ]
+        for src in template_candidates:
+            if src.exists():
+                shutil.copyfile(src, index_path)
+                print(f"Copied {src} -> {index_path}", flush=True)
+                break
+        else:
+            index_path.write_text(
+                "<!doctype html><meta charset=utf-8><title>Dashboard</title><p>data.json generated.",
+                encoding="utf-8",
+            )
 
     print(f"Wrote {out_json} and {index_path}")
     return 0
-
-
-_DEFAULT_INDEX_HTML = """<!DOCTYPE html>
-<html lang=\"en\">
-<head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>Garmin Dashboard</title>
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 1rem; }
-    header { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; margin-bottom: 1rem; }
-    .row { display: grid; grid-template-columns: 1fr; gap: 1.5rem; }
-    @media (min-width: 960px) { .row { grid-template-columns: 1fr 1fr; } }
-    .card { padding: 1rem; border: 1px solid #ddd; border-radius: 8px; }
-    label { margin-right: .25rem; }
-    .controls { display: flex; gap: .75rem; align-items: center; }
-    .seg { display: inline-flex; border: 1px solid #bbb; border-radius: 6px; overflow: hidden; }
-    .seg button { border: 0; background: #f6f6f6; padding: .4rem .6rem; cursor: pointer; }
-    .seg button.active { background: #333; color: #fff; }
-  </style>
-  <script src=\"https://cdn.jsdelivr.net/npm/luxon@3\"></script>
-  <script src=\"https://cdn.jsdelivr.net/npm/chart.js@4\"></script>
-  <script src=\"https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1\"></script>
-  <script src=\"https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2\"></script>
-</head>
-<body>
-  <h1>Garmin Dashboard</h1>
-  <header>
-    <div class=\"controls\">
-      <label for=\"from\">From</label>
-      <input type=\"date\" id=\"from\" />
-      <label for=\"to\">To</label>
-      <input type=\"date\" id=\"to\" />
-    </div>
-    <div class=\"controls\">
-      <span>Bucket:</span>
-      <div class=\"seg\" id=\"bucket\"> 
-        <button data-b=\"day\" class=\"active\">Day</button>
-        <button data-b=\"week\">Week</button>
-        <button data-b=\"month\">Month</button>
-      </div>
-      <button id=\"resetRange\" title=\"Reset date range\">Reset</button>
-    </div>
-  </header>
-  <div class=\"row\">
-    <div class=\"card\"><h3>Average Sleep (hours)</h3><canvas id=\"sleepChart\"></canvas></div>
-    <div class=\"card\"><h3>Average Stress</h3><canvas id=\"stressChart\"></canvas></div>
-    <div class=\"card\"><h3>Average BPM</h3><canvas id=\"hrChart\"></canvas></div>
-  </div>
-
-  <script>
-    const TZ = 'Europe/Paris';
-    const DateTime = luxon.DateTime;
-    if (window['chartjs-plugin-zoom']) Chart.register(window['chartjs-plugin-zoom']);
-
-    function parseISOZ(s) { return DateTime.fromISO(s, { zone: 'utc' }); }
-
-    function bucketKey(dt, bucket) {
-      const l = dt.setZone(TZ);
-      if (bucket === 'day') return l.toFormat('yyyy-LL-dd');
-      if (bucket === 'week') {
-        // ISO week, Monday as first day
-        const weekStart = l.startOf('week');
-        return weekStart.toFormat('kkkk-\'W\'WW');
-      }
-      if (bucket === 'month') return l.toFormat('yyyy-LL');
-      return l.toFormat('yyyy-LL-dd');
-    }
-
-    function toDayKey(dt) { return dt.setZone(TZ).toFormat('yyyy-LL-dd'); }
-
-    function aggregate(data, from, to, bucket) {
-      // Use precomputed daily series; bucket to day/week/month with fast grouping
-      const fromDT = from ? DateTime.fromISO(from, { zone: TZ }).startOf('day') : null;
-      const toDT = to ? DateTime.fromISO(to, { zone: TZ }).endOf('day') : null;
-      const daily = data.daily || { hr: [], stress: [], sleep: [] };
-
-      const aggDaily = (arr, valueKey) => {
-        const map = new Map();
-        for (const row of arr) {
-          const dt = DateTime.fromFormat(row.day, 'yyyy-LL-dd', { zone: TZ });
-          if (fromDT && dt < fromDT) continue;
-          if (toDT && dt > toDT) continue;
-          const k = bucketKey(dt, bucket);
-          const e = map.get(k) || { sum: 0, n: 0 };
-          const v = row[valueKey];
-          if (typeof v === 'number') { e.sum += v; e.n += 1; }
-          map.set(k, e);
-        }
-        const pts = [...map.entries()].map(([k, v]) => ({ x: keyToCenterTS(k, bucket), y: v.n ? v.sum / v.n : null }));
-        pts.sort((a, b) => a.x - b.x);
-        return pts;
-      };
-
-      return {
-        hr: aggDaily(daily.hr, 'avg'),
-        stress: aggDaily(daily.stress, 'avg'),
-        sleep: aggDaily(daily.sleep, 'hours'),
-      };
-    }
-
-    function keyToCenterTS(k, bucket) {
-      if (bucket === 'day') return DateTime.fromFormat(k, 'yyyy-LL-dd', { zone: TZ }).plus({ hours: 12 }).toJSDate();
-      if (bucket === 'week') {
-        const dt = DateTime.fromFormat(k, "kkkk-'W'WW", { zone: TZ }).startOf('week');
-        return dt.plus({ days: 3 }).toJSDate(); // mid-week
-      }
-      if (bucket === 'month') return DateTime.fromFormat(k, 'yyyy-LL', { zone: TZ }).plus({ days: 14 }).toJSDate();
-      return DateTime.now().toJSDate();
-    }
-
-    async function loadData() {
-      const resp = await fetch('data.json');
-      if (!resp.ok) throw new Error('Failed to load data.json');
-      return await resp.json();
-    }
-
-    function newLineChart(ctx, label, color) {
-      return new Chart(ctx, {
-        type: 'line',
-        data: { datasets: [{
-          label,
-          data: [],
-          borderColor: color,
-          backgroundColor: color,
-          pointRadius: 2.5,
-          pointHoverRadius: 6,
-          pointHitRadius: 10,
-          pointBorderColor: '#fff',
-          pointBorderWidth: 1,
-          tension: 0.2,
-        }] },
-        options: {
-          responsive: true,
-          interaction: { mode: 'nearest', intersect: true },
-          scales: {
-            x: { type: 'time', time: { unit: 'day' } },
-            y: { beginAtZero: true }
-          },
-          elements: { point: { radius: 2.5, hoverRadius: 6, hitRadius: 10 } },
-          plugins: {
-            legend: { display: false }
-          }
-        }
-      });
-    }
-
-    (async () => {
-      const data = await loadData();
-      const sleepChart = newLineChart(document.getElementById('sleepChart'), 'Sleep (hours)', '#3b82f6');
-      const stressChart = newLineChart(document.getElementById('stressChart'), 'Stress', '#ef4444');
-      const hrChart = newLineChart(document.getElementById('hrChart'), 'HR (bpm)', '#10b981');
-
-      // Default range based on daily coverage (union across metrics)
-      const daily = data.daily || { hr: [], stress: [], sleep: [] };
-      const dailyDates = [
-        ...daily.hr.map(r => DateTime.fromFormat(r.day, 'yyyy-LL-dd', { zone: TZ })),
-        ...daily.stress.map(r => DateTime.fromFormat(r.day, 'yyyy-LL-dd', { zone: TZ })),
-        ...daily.sleep.map(r => DateTime.fromFormat(r.day, 'yyyy-LL-dd', { zone: TZ })),
-      ];
-      const allTs = dailyDates.length ? dailyDates : [
-        ...data.hr_samples.map(s => parseISOZ(s.ts)),
-        ...data.stress_samples.map(s => parseISOZ(s.ts)),
-        ...data.sleep_sessions.flatMap(s => [s.start && parseISOZ(s.start), s.end && parseISOZ(s.end)].filter(Boolean)),
-      ];
-      const minTs = allTs.length ? DateTime.min(...allTs) : DateTime.now().minus({ months: 1 });
-      const maxTs = allTs.length ? DateTime.max(...allTs) : DateTime.now();
-      const defaultFrom = minTs.setZone(TZ).toFormat('yyyy-LL-dd');
-      const defaultTo = maxTs.setZone(TZ).toFormat('yyyy-LL-dd');
-      document.getElementById('from').value = defaultFrom;
-      document.getElementById('to').value = defaultTo;
-
-      let bucket = 'day';
-
-      function onZoomApplied(chart) {
-        const scale = chart.scales.x;
-        if (!scale) return;
-        const from = DateTime.fromMillis(scale.min, { zone: TZ }).toFormat('yyyy-LL-dd');
-        const to = DateTime.fromMillis(scale.max, { zone: TZ }).toFormat('yyyy-LL-dd');
-        document.getElementById('from').value = from;
-        document.getElementById('to').value = to;
-        refresh();
-        setTimeout(() => { if (chart.resetZoom) chart.resetZoom(); }, 0);
-      }
-
-      function refresh() {
-        const from = document.getElementById('from').value || null;
-        const to = document.getElementById('to').value || null;
-        const agg = aggregate(data, from, to, bucket);
-        sleepChart.data.datasets[0].data = agg.sleep;
-        stressChart.data.datasets[0].data = agg.stress;
-        hrChart.data.datasets[0].data = agg.hr;
-        sleepChart.update();
-        stressChart.update();
-        hrChart.update();
-      }
-
-      document.getElementById('from').addEventListener('change', refresh);
-      document.getElementById('to').addEventListener('change', refresh);
-      document.getElementById('bucket').addEventListener('click', (e) => {
-        const b = e.target?.dataset?.b; if (!b) return;
-        bucket = b;
-        for (const btn of e.currentTarget.querySelectorAll('button')) btn.classList.toggle('active', btn.dataset.b === b);
-        refresh();
-      });
-      document.getElementById('resetRange').addEventListener('click', () => {
-        document.getElementById('from').value = defaultFrom;
-        document.getElementById('to').value = defaultTo;
-        refresh();
-        if (sleepChart.resetZoom) sleepChart.resetZoom();
-        if (stressChart.resetZoom) stressChart.resetZoom();
-        if (hrChart.resetZoom) hrChart.resetZoom();
-      });
-
-      refresh();
-    })().catch(err => {
-      console.error(err);
-      alert('Failed to initialize dashboard: ' + err.message);
-    });
-  </script>
-</body>
-</html>
-"""
 
 
 if __name__ == "__main__":
