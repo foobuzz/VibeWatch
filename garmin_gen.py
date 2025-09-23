@@ -388,19 +388,34 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
     hr_all = dedup_time_series(hr_all)
     stress_all = dedup_time_series(stress_all)
 
-    # Build sessions from the global sleep timeline
-    if sleep_timeline:
+    # Build sessions from the global sleep timeline only if no event-based sessions were found
+    if not sleep_all and sleep_timeline:
         sleep_all.extend(_build_sleep_sessions_from_timeline(sleep_timeline))
 
-    # Merge sleep sessions that are duplicates by duration and close timestamps
-    merged_sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]] = []
-    seen_sigs = set()
-    for st, en, dur in sleep_all:
-        sig = (int(dur or 0), int(st.timestamp()) if st else 0, int(en.timestamp()) if en else 0)
-        if sig in seen_sigs:
-            continue
-        seen_sigs.add(sig)
-        merged_sleep.append((st, en, dur))
+    # Merge overlapping/adjacent sessions to avoid double-counting across files/snapshots
+    def merge_sessions(sessions: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]) -> List[Tuple[datetime, datetime, int]]:
+        items: List[Tuple[datetime, datetime]] = []
+        for st, en, _ in sessions:
+            if isinstance(st, datetime) and isinstance(en, datetime) and en > st:
+                items.append((st.astimezone(timezone.utc), en.astimezone(timezone.utc)))
+        if not items:
+            return []
+        items.sort(key=lambda x: x[0])
+        merged: List[Tuple[datetime, datetime]] = []
+        cur_s, cur_e = items[0]
+        tol = timedelta(minutes=10)
+        for s, e in items[1:]:
+            if s <= cur_e + tol:  # overlap or close gap
+                if e > cur_e:
+                    cur_e = e
+            else:
+                merged.append((cur_s, cur_e))
+                cur_s, cur_e = s, e
+        merged.append((cur_s, cur_e))
+        return [(s, e, int((e - s).total_seconds())) for s, e in merged]
+
+    # Merge duplicates and overlaps
+    merged_sleep = merge_sessions(sleep_all)
     print(f"Parsed: HR samples={len(hr_all)}, Stress samples={len(stress_all)}, Sleep sessions={len(merged_sleep)} (timeline points={len(sleep_timeline)})", flush=True)
     return hr_all, stress_all, merged_sleep
 
