@@ -11,3 +11,4 @@ dependencies = [
 
 [project.scripts]
 garmin-gen = "garmin_gen:main"
+garmin-demo = "scripts.generate_demo:main"
