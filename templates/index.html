@@ -53,6 +53,8 @@
   <script>
     const TZ = 'Europe/Paris';
     const DateTime = luxon.DateTime;
+    // Guard to ignore zoom callbacks triggered by programmatic resetZoom
+    let SUPPRESS_NEXT_ZOOM = false;
     // Register plugins explicitly
     if (window['chartjs-plugin-annotation']) Chart.register(window['chartjs-plugin-annotation']);
     if (window['chartjs-plugin-zoom']) Chart.register(window['chartjs-plugin-zoom']);
@@ -221,36 +223,43 @@
       let refreshTimer = null;
       function refresh() {
         if (refreshTimer) clearTimeout(refreshTimer);
-        setLoading(true);
         refreshTimer = setTimeout(() => {
-        const from = document.getElementById('from').value || null;
-        const to = document.getElementById('to').value || null;
-        const agg = aggregate(data, from, to, bucket);
-        sleepChart.data.datasets[0].data = agg.sleep;
-        stressChart.data.datasets[0].data = agg.stress;
-        hrChart.data.datasets[0].data = agg.hr;
-        // Missing annotations per chart
-        hrChart.options.plugins.annotation.annotations = buildAnnotations(data.missing_spans?.hr, from, to, 'rgba(16,185,129,0.08)');
-        stressChart.options.plugins.annotation.annotations = buildAnnotations(data.missing_spans?.stress, from, to, 'rgba(239,68,68,0.08)');
-        sleepChart.options.plugins.annotation.annotations = buildAnnotations(data.missing_spans?.sleep, from, to, 'rgba(59,130,246,0.08)');
-        sleepChart.update();
-        stressChart.update();
-        hrChart.update();
-        setLoading(false);
-        refreshTimer = null;
+          setLoading(true);
+          try {
+            const from = document.getElementById('from').value || null;
+            const to = document.getElementById('to').value || null;
+            const agg = aggregate(data, from, to, bucket);
+            sleepChart.data.datasets[0].data = agg.sleep;
+            stressChart.data.datasets[0].data = agg.stress;
+            hrChart.data.datasets[0].data = agg.hr;
+            // Missing annotations per chart
+            hrChart.options.plugins.annotation.annotations = buildAnnotations(data.missing_spans?.hr, from, to, 'rgba(16,185,129,0.08)');
+            stressChart.options.plugins.annotation.annotations = buildAnnotations(data.missing_spans?.stress, from, to, 'rgba(239,68,68,0.08)');
+            sleepChart.options.plugins.annotation.annotations = buildAnnotations(data.missing_spans?.sleep, from, to, 'rgba(59,130,246,0.08)');
+            sleepChart.update();
+            stressChart.update();
+            hrChart.update();
+          } catch (e) {
+            console.error('Refresh failed:', e);
+          } finally {
+            setLoading(false);
+            refreshTimer = null;
+          }
         }, 50);
       }
 
       document.getElementById('from').addEventListener('change', refresh);
       document.getElementById('to').addEventListener('change', refresh);
       document.getElementById('resetRange').addEventListener('click', () => {
-        document.getElementById('from').value = defaultFrom;
-        document.getElementById('to').value = defaultTo;
-        refresh();
-        // Also reset any zoom transforms so axes auto-scale to the new data
+        // Clear any zoom transforms without triggering zoom callback
+        SUPPRESS_NEXT_ZOOM = true;
         if (sleepChart.resetZoom) sleepChart.resetZoom();
         if (stressChart.resetZoom) stressChart.resetZoom();
         if (hrChart.resetZoom) hrChart.resetZoom();
+        // Restore default input range and refresh
+        document.getElementById('from').value = defaultFrom;
+        document.getElementById('to').value = defaultTo;
+        refresh();
       });
       document.getElementById('bucket').addEventListener('click', (e) => {
         const b = e.target?.dataset?.b; if (!b) return;
@@ -266,6 +275,7 @@
     });
 
     function onZoomApplied(chart) {
+      if (SUPPRESS_NEXT_ZOOM) { SUPPRESS_NEXT_ZOOM = false; return; }
       const scale = chart.scales.x;
       if (!scale) return;
       const from = DateTime.fromMillis(scale.min, { zone: TZ }).toFormat('yyyy-LL-dd');
@@ -278,9 +288,8 @@
         document.getElementById('from').dispatchEvent(evt);
       };
       refreshNow();
-      setTimeout(() => { if (chart.resetZoom) chart.resetZoom(); }, 0);
+      setTimeout(() => { if (chart.resetZoom) { SUPPRESS_NEXT_ZOOM = true; chart.resetZoom(); } }, 0);
     }
   </script>
 </body>
 </html>
-
