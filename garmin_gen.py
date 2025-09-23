@@ -426,7 +426,8 @@ def to_iso(ts: datetime) -> str:
 
 def json_payload(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, int]],
                  sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]],
-                 missing_spans: Dict[str, List[Dict[str, str]]]) -> Dict[str, Any]:
+                 missing_spans: Dict[str, List[Dict[str, str]]],
+                 daily: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     return {
         "hr_samples": [
             {"ts": to_iso(ts), "hr": val} for ts, val in hr
@@ -447,6 +448,7 @@ def json_payload(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, in
             "generated_at": to_iso(datetime.now(timezone.utc)),
         },
         "missing_spans": missing_spans,
+        "daily": daily,
     }
 
 
@@ -464,7 +466,6 @@ def local_day_bounds(dt: datetime, tz: ZoneInfo) -> Tuple[datetime, datetime]:
     start_local = datetime(local.year, local.month, local.day, tzinfo=tz)
     end_local = start_local + timedelta(days=1)
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
-
 
 def _group_missing_days(day_set: set, start_local: datetime, end_local: datetime) -> List[Tuple[str, str]]:
     spans: List[Tuple[str, str]] = []
@@ -555,6 +556,60 @@ def compute_missing(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime,
     return "\n".join(lines), spans_json
 
 
+def compute_daily(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, int]],
+                  sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]], tz_name: str) -> Dict[str, List[Dict[str, Any]]]:
+    tz = ZoneInfo(tz_name)
+
+    def day_str(dt: datetime) -> str:
+        return dt.astimezone(tz).strftime("%Y-%m-%d")
+
+    # HR/stress daily averages
+    hr_acc: Dict[str, Tuple[int, int]] = {}  # day -> (sum, count)
+    for ts, val in hr:
+        d = day_str(ts)
+        s, c = hr_acc.get(d, (0, 0))
+        hr_acc[d] = (s + val, c + 1)
+    stress_acc: Dict[str, Tuple[int, int]] = {}
+    for ts, val in stress:
+        d = day_str(ts)
+        s, c = stress_acc.get(d, (0, 0))
+        stress_acc[d] = (s + val, c + 1)
+
+    hr_daily = [{"day": d, "avg": (s / c) if c else None} for d, (s, c) in hr_acc.items()]
+    stress_daily = [{"day": d, "avg": (s / c) if c else None} for d, (s, c) in stress_acc.items()]
+    hr_daily.sort(key=lambda x: x["day"])
+    stress_daily.sort(key=lambda x: x["day"])
+
+    # Sleep: per-day total minutes (split sessions across days in local time)
+    sleep_min: Dict[str, float] = {}
+    for st, en, dur in sleep:
+        if isinstance(st, datetime) and isinstance(en, datetime):
+            start = st.astimezone(tz)
+            end = en.astimezone(tz)
+            cur = start.replace(hour=0, minute=0, second=0, microsecond=0)
+            while cur < end:
+                next_day = cur + timedelta(days=1)
+                seg_start = max(start, cur)
+                seg_end = min(end, next_day)
+                minutes = max(0.0, (seg_end - seg_start).total_seconds() / 60.0)
+                if minutes > 0:
+                    key = cur.strftime("%Y-%m-%d")
+                    sleep_min[key] = sleep_min.get(key, 0.0) + minutes
+                cur = next_day
+        elif dur and isinstance(dur, int):
+            # Duration without timestamps; cannot attribute to a day, skip
+            pass
+
+    sleep_daily = [{"day": d, "hours": mins / 60.0} for d, mins in sleep_min.items()]
+    sleep_daily.sort(key=lambda x: x["day"])
+
+    return {
+        "hr": hr_daily,
+        "stress": stress_daily,
+        "sleep": sleep_daily,
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     tz = ZoneInfo(args.tz)
@@ -568,8 +623,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Write JSON
     print("Analyzing missing days ...", flush=True)
     report, spans_json = compute_missing(hr, stress, sleep, args.tz)
+    print("Computing daily aggregates ...", flush=True)
+    daily = compute_daily(hr, stress, sleep, args.tz)
     print("Writing dist/data.json ...", flush=True)
-    payload = json_payload(hr, stress, sleep, spans_json)
+    payload = json_payload(hr, stress, sleep, spans_json, daily)
     out_json = args.out / "data.json"
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
@@ -659,70 +716,32 @@ _DEFAULT_INDEX_HTML = """<!DOCTYPE html>
     function toDayKey(dt) { return dt.setZone(TZ).toFormat('yyyy-LL-dd'); }
 
     function aggregate(data, from, to, bucket) {
-      // data: { hr_samples, stress_samples, sleep_sessions }
+      // Use precomputed daily series; bucket to day/week/month with fast grouping
       const fromDT = from ? DateTime.fromISO(from, { zone: TZ }).startOf('day') : null;
       const toDT = to ? DateTime.fromISO(to, { zone: TZ }).endOf('day') : null;
+      const daily = data.daily || { hr: [], stress: [], sleep: [] };
 
-      // HR and Stress: average of samples in bucket
-      const aggSeries = (samples, field) => {
+      const aggDaily = (arr, valueKey) => {
         const map = new Map();
-        for (const s of samples) {
-          const ts = parseISOZ(s.ts);
-          if (fromDT && ts < fromDT) continue;
-          if (toDT && ts > toDT) continue;
-          const k = bucketKey(ts, bucket);
-          const e = map.get(k) || { sum: 0, n: 0, ts: ts };
-          e.sum += s[field]; e.n += 1; e.ts = ts;
+        for (const row of arr) {
+          const dt = DateTime.fromFormat(row.day, 'yyyy-LL-dd', { zone: TZ });
+          if (fromDT && dt < fromDT) continue;
+          if (toDT && dt > toDT) continue;
+          const k = bucketKey(dt, bucket);
+          const e = map.get(k) || { sum: 0, n: 0 };
+          const v = row[valueKey];
+          if (typeof v === 'number') { e.sum += v; e.n += 1; }
           map.set(k, e);
         }
-        const points = [...map.entries()].map(([k, v]) => ({ x: keyToCenterTS(k, bucket), y: v.n ? v.sum / v.n : null }));
-        points.sort((a, b) => a.x - b.x);
-        return points;
+        const pts = [...map.entries()].map(([k, v]) => ({ x: keyToCenterTS(k, bucket), y: v.n ? v.sum / v.n : null }));
+        pts.sort((a, b) => a.x - b.x);
+        return pts;
       };
 
-      // Sleep: convert sessions to per-day duration, then average per bucket (days in bucket)
-      const dayDur = new Map(); // dayKey -> minutes
-      for (const s of data.sleep_sessions) {
-        let start = s.start ? parseISOZ(s.start).setZone(TZ) : null;
-        let end = s.end ? parseISOZ(s.end).setZone(TZ) : null;
-        let durSec = typeof s.duration_sec === 'number' ? s.duration_sec : null;
-        if (!start && !end && durSec == null) continue;
-        if (!start && end && durSec != null) start = end.minus({ seconds: durSec });
-        if (start && !end && durSec != null) end = start.plus({ seconds: durSec });
-        if (!start || !end) continue;
-        // Split across days
-        let cur = start.startOf('day');
-        while (cur < end) {
-          const next = cur.plus({ days: 1 });
-          const segStart = start > cur ? start : cur;
-          const segEnd = end < next ? end : next;
-          const minutes = Math.max(0, segEnd.diff(segStart, 'minutes').minutes);
-          if (minutes > 0) {
-            if ((!fromDT || segEnd >= fromDT) && (!toDT || segStart <= toDT)) {
-              const k = cur.toFormat('yyyy-LL-dd');
-              dayDur.set(k, (dayDur.get(k) || 0) + minutes);
-            }
-          }
-          cur = next;
-        }
-      }
-      // Average per bucket (by days present in bucket)
-      const sleepMap = new Map(); // bucketKey -> { sumMin, days }
-      for (const [day, min] of dayDur.entries()) {
-        const dt = DateTime.fromFormat(day, 'yyyy-LL-dd', { zone: TZ });
-        if (fromDT && dt.endOf('day') < fromDT) continue;
-        if (toDT && dt.startOf('day') > toDT) continue;
-        const k = bucketKey(dt, bucket);
-        const e = sleepMap.get(k) || { sum: 0, days: 0 };
-        e.sum += min; e.days += 1; sleepMap.set(k, e);
-      }
-      const sleepPts = [...sleepMap.entries()].map(([k, v]) => ({ x: keyToCenterTS(k, bucket), y: v.days ? (v.sum / v.days) / 60.0 : null }));
-      sleepPts.sort((a, b) => a.x - b.x);
-
       return {
-        hr: aggSeries(data.hr_samples, 'hr'),
-        stress: aggSeries(data.stress_samples, 'stress'),
-        sleep: sleepPts,
+        hr: aggDaily(daily.hr, 'avg'),
+        stress: aggDaily(daily.stress, 'avg'),
+        sleep: aggDaily(daily.sleep, 'hours'),
       };
     }
 
@@ -778,8 +797,14 @@ _DEFAULT_INDEX_HTML = """<!DOCTYPE html>
       const stressChart = newLineChart(document.getElementById('stressChart'), 'Stress', '#ef4444');
       const hrChart = newLineChart(document.getElementById('hrChart'), 'HR (bpm)', '#10b981');
 
-      // Default range based on data
-      const allTs = [
+      // Default range based on daily coverage (union across metrics)
+      const daily = data.daily || { hr: [], stress: [], sleep: [] };
+      const dailyDates = [
+        ...daily.hr.map(r => DateTime.fromFormat(r.day, 'yyyy-LL-dd', { zone: TZ })),
+        ...daily.stress.map(r => DateTime.fromFormat(r.day, 'yyyy-LL-dd', { zone: TZ })),
+        ...daily.sleep.map(r => DateTime.fromFormat(r.day, 'yyyy-LL-dd', { zone: TZ })),
+      ];
+      const allTs = dailyDates.length ? dailyDates : [
         ...data.hr_samples.map(s => parseISOZ(s.ts)),
         ...data.stress_samples.map(s => parseISOZ(s.ts)),
         ...data.sleep_sessions.flatMap(s => [s.start && parseISOZ(s.start), s.end && parseISOZ(s.end)].filter(Boolean)),
