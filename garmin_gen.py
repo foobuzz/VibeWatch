@@ -742,14 +742,29 @@ _DEFAULT_INDEX_HTML = """<!DOCTYPE html>
     function newLineChart(ctx, label, color) {
       return new Chart(ctx, {
         type: 'line',
-        data: { datasets: [{ label, data: [], borderColor: color, pointRadius: 0, tension: 0.2 }] },
+        data: { datasets: [{
+          label,
+          data: [],
+          borderColor: color,
+          backgroundColor: color,
+          pointRadius: 2.5,
+          pointHoverRadius: 6,
+          pointHitRadius: 10,
+          pointBorderColor: '#fff',
+          pointBorderWidth: 1,
+          tension: 0.2,
+        }] },
         options: {
           responsive: true,
+          interaction: { mode: 'nearest', intersect: true },
           scales: {
             x: { type: 'time', time: { unit: 'day' } },
             y: { beginAtZero: true }
           },
-          plugins: { legend: { display: false } }
+          elements: { point: { radius: 2.5, hoverRadius: 6, hitRadius: 10 } },
+          plugins: {
+            legend: { display: false }
+          }
         }
       });
     }
