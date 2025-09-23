@@ -188,6 +188,7 @@ def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime],
     starts: List[datetime] = []
     ends: List[datetime] = []
     try:
+        pending_start: Optional[datetime] = None
         timeline: List[Tuple[datetime, int]] = []
         for name, fields in messages:
             # Common summary message
@@ -201,6 +202,23 @@ def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime],
                     starts.append(st)
                 if en is not None:
                     ends.append(en)
+            # Event-based sessions (explicit start/stop in Sleep files)
+            if name == "event":
+                ts = ensure_dt(fields.get("timestamp"))
+                etype = fields.get("event_type")
+                ev = fields.get("event")
+                if ts is not None and etype in ("start", "stop"):
+                    # Many devices use event code 74 for sleep in Sleep FITs
+                    if isinstance(ev, int) and ev not in (74,):
+                        pass  # not a sleep event
+                    else:
+                        if etype == "start":
+                            pending_start = ts
+                        elif etype == "stop" and pending_start is not None:
+                            if ts > pending_start:
+                                sessions.append((pending_start, ts, int((ts - pending_start).total_seconds())))
+                            pending_start = None
+
             # Sleep level timeline (derive sessions)
             if name == "sleep_level":
                 ts = ensure_dt(fields.get("timestamp"))
