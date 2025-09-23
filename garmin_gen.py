@@ -83,6 +83,25 @@ def iter_fit_messages(path: Path):
     return
 
 
+def iter_fit_messages_fitdecode(path: Path):
+    if fitdecode is None:
+        return
+    try:
+        with fitdecode.FitReader(str(path)) as fr:
+            for frame in fr:
+                if isinstance(frame, FitDataMessage):
+                    name = frame.name or ""
+                    fields = {}
+                    for f in frame.fields:
+                        try:
+                            fields[f.name] = f.value
+                        except Exception:
+                            pass
+                    yield name, fields
+    except Exception:
+        return
+
+
 def ensure_dt(dt: Any) -> Optional[datetime]:
     if isinstance(dt, datetime):
         # FIT usually stores UTC; ensure timezone-aware
@@ -203,36 +222,7 @@ def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime],
                 if en is not None:
                     ends.append(en)
 
-        # Derive sessions from timeline: consider levels > 1 as sleeping
-        if timeline:
-            timeline.sort(key=lambda x: x[0])
-            in_sleep = False
-            cur_start: Optional[datetime] = None
-            last_ts: Optional[datetime] = None
-            last_lvl: Optional[int] = None
-            for ts, lvl in timeline:
-                if in_sleep:
-                    # If we were sleeping and a long gap occurs, close session
-                    if last_ts and (ts - last_ts).total_seconds() > 60 * 30:  # 30+ min gap ends session
-                        if cur_start and last_ts and last_ts > cur_start:
-                            sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
-                        in_sleep = False
-                        cur_start = None
-                if lvl and lvl > 1:
-                    if not in_sleep:
-                        in_sleep = True
-                        cur_start = ts
-                else:
-                    if in_sleep:
-                        # end of sleep
-                        if cur_start and last_ts and last_ts > cur_start:
-                            sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
-                        in_sleep = False
-                        cur_start = None
-                last_ts, last_lvl = ts, lvl
-            # Close trailing session
-            if in_sleep and cur_start and last_ts and last_ts > cur_start:
-                sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
+        # Note: actual session derivation is done globally in parse_snapshots
     except Exception:
         pass
 
@@ -249,10 +239,61 @@ def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime],
     return sessions
 
 
+def _build_sleep_sessions_from_timeline(timeline: List[Tuple[datetime, int]]) -> List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]:
+    sessions: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]] = []
+    if not timeline:
+        return sessions
+    timeline.sort(key=lambda x: x[0])
+    in_sleep = False
+    cur_start: Optional[datetime] = None
+    last_ts: Optional[datetime] = None
+    for ts, lvl in timeline:
+        if in_sleep:
+            if last_ts and (ts - last_ts).total_seconds() > 60 * 30:  # 30+ min gap ends session
+                if cur_start and last_ts and last_ts > cur_start:
+                    sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
+                in_sleep = False
+                cur_start = None
+        if isinstance(lvl, int) and lvl >= 1:
+            if not in_sleep:
+                in_sleep = True
+                cur_start = ts
+        else:
+            if in_sleep:
+                if cur_start and last_ts and last_ts > cur_start:
+                    sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
+                in_sleep = False
+                cur_start = None
+        last_ts = ts
+    if in_sleep and cur_start and last_ts and last_ts > cur_start:
+        sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
+    return sessions
+
+
+def _extract_sleep_timeline_from_iter(messages) -> List[Tuple[datetime, int]]:
+    timeline: List[Tuple[datetime, int]] = []
+    try:
+        for name, fields in messages:
+            if name == "sleep_level":
+                ts = ensure_dt(fields.get("timestamp"))
+                raw = fields.get("sleep_level")
+                lvl_val: Optional[int] = None
+                if isinstance(raw, int):
+                    lvl_val = raw
+                elif isinstance(raw, str):
+                    lvl_val = 0 if raw.lower() == "awake" else 1  # treat non-awake as sleep
+                if ts is not None and isinstance(lvl_val, int):
+                    timeline.append((ts, lvl_val))
+    except Exception:
+        pass
+    return timeline
+
+
 def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, int]], List[Tuple[datetime, int]], List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]]:
     hr_all: List[Tuple[datetime, int]] = []
     stress_all: List[Tuple[datetime, int]] = []
     sleep_all: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]] = []
+    sleep_timeline: List[Tuple[datetime, int]] = []
 
     snaps = list_snapshot_dirs(root)
     print(f"Found {len(snaps)} snapshot(s) in {root}", flush=True)
@@ -287,8 +328,12 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
             if limit:
                 files = files[:limit]
             for i, total, f in iter_with_progress(files, "Sleep"):
-                msgs = iter_fit_messages(f)
+                # Prefer fitdecode for Sleep files to access sleep_level timeline
+                msgs = iter_fit_messages_fitdecode(f)
                 sleep_all.extend(extract_sleep_sessions_from_iter(msgs))
+                # Collect fine-grained sleep levels for global session derivation
+                msgs2 = iter_fit_messages_fitdecode(f)
+                sleep_timeline.extend(_extract_sleep_timeline_from_iter(msgs2))
 
         # Metrics → sometimes contains sleep summary and stress
         met_dir = snap / "Metrics"
@@ -307,6 +352,9 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
                 # and only keep samples where message contained instantaneous HR
                 hr_all.extend(hr)
                 stress_all.extend(st)
+                # Also collect any sleep levels present in metrics (rare)
+                msgs3 = iter_fit_messages_fitdecode(f)
+                sleep_timeline.extend(_extract_sleep_timeline_from_iter(msgs3))
         print(f"  Done {snap.name}", flush=True)
 
     # Deduplicate by timestamp for hr and stress
@@ -322,6 +370,10 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
     hr_all = dedup_time_series(hr_all)
     stress_all = dedup_time_series(stress_all)
 
+    # Build sessions from the global sleep timeline
+    if sleep_timeline:
+        sleep_all.extend(_build_sleep_sessions_from_timeline(sleep_timeline))
+
     # Merge sleep sessions that are duplicates by duration and close timestamps
     merged_sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]] = []
     seen_sigs = set()
@@ -331,7 +383,7 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
             continue
         seen_sigs.add(sig)
         merged_sleep.append((st, en, dur))
-    print(f"Parsed: HR samples={len(hr_all)}, Stress samples={len(stress_all)}, Sleep sessions={len(merged_sleep)}", flush=True)
+    print(f"Parsed: HR samples={len(hr_all)}, Stress samples={len(stress_all)}, Sleep sessions={len(merged_sleep)} (timeline points={len(sleep_timeline)})", flush=True)
     return hr_all, stress_all, merged_sleep
 
 
@@ -340,7 +392,8 @@ def to_iso(ts: datetime) -> str:
 
 
 def json_payload(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, int]],
-                 sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]) -> Dict[str, Any]:
+                 sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]],
+                 missing_spans: Dict[str, List[Dict[str, str]]]) -> Dict[str, Any]:
     return {
         "hr_samples": [
             {"ts": to_iso(ts), "hr": val} for ts, val in hr
@@ -360,6 +413,7 @@ def json_payload(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, in
             "tz": "Europe/Paris",
             "generated_at": to_iso(datetime.now(timezone.utc)),
         },
+        "missing_spans": missing_spans,
     }
 
 
@@ -379,8 +433,33 @@ def local_day_bounds(dt: datetime, tz: ZoneInfo) -> Tuple[datetime, datetime]:
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
-def missing_days_report(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, int]],
-                        sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]], tz_name: str) -> str:
+def _group_missing_days(day_set: set, start_local: datetime, end_local: datetime) -> List[Tuple[str, str]]:
+    spans: List[Tuple[str, str]] = []
+    cur_start: Optional[datetime] = None
+    cur_end: Optional[datetime] = None
+    d = start_local
+    while d <= end_local:
+        day_str = d.strftime("%Y-%m-%d")
+        missing = day_str not in day_set
+        if missing:
+            if cur_start is None:
+                cur_start = d
+                cur_end = d
+            else:
+                cur_end = d
+        else:
+            if cur_start is not None and cur_end is not None:
+                spans.append((cur_start.strftime("%Y-%m-%d"), cur_end.strftime("%Y-%m-%d")))
+                cur_start = None
+                cur_end = None
+        d = d + timedelta(days=1)
+    if cur_start is not None and cur_end is not None:
+        spans.append((cur_start.strftime("%Y-%m-%d"), cur_end.strftime("%Y-%m-%d")))
+    return spans
+
+
+def compute_missing(hr: List[Tuple[datetime, int]], stress: List[Tuple[datetime, int]],
+                    sleep: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]], tz_name: str) -> Tuple[str, Dict[str, List[Dict[str, str]]]]:
     tz = ZoneInfo(tz_name)
 
     # Build day sets
@@ -422,20 +501,25 @@ def missing_days_report(hr: List[Tuple[datetime, int]], stress: List[Tuple[datet
             sl_days.add(day_key(en))
         # If only duration given, we can't map to a day
 
-    # Iterate calendar days
-    report_lines = []
-    d = start_local
-    while d <= end_local:
-        day_str = d.strftime("%Y-%m-%d")
-        if day_str not in hr_days:
-            report_lines.append(f"Missing HR for {day_str}")
-        if day_str not in st_days:
-            report_lines.append(f"Missing Stress for {day_str}")
-        if day_str not in sl_days:
-            report_lines.append(f"Missing Sleep for {day_str}")
-        d = d + timedelta(days=1)
+    # Group spans per metric
+    hr_spans = _group_missing_days(hr_days, start_local, end_local)
+    st_spans = _group_missing_days(st_days, start_local, end_local)
+    sl_spans = _group_missing_days(sl_days, start_local, end_local)
 
-    return "\n".join(report_lines)
+    lines = []
+    for a, b in hr_spans:
+        lines.append(f"Missing HR from {a} to {b}")
+    for a, b in st_spans:
+        lines.append(f"Missing Stress from {a} to {b}")
+    for a, b in sl_spans:
+        lines.append(f"Missing Sleep from {a} to {b}")
+
+    spans_json = {
+        "hr": [{"from": a, "to": b} for a, b in hr_spans],
+        "stress": [{"from": a, "to": b} for a, b in st_spans],
+        "sleep": [{"from": a, "to": b} for a, b in sl_spans],
+    }
+    return "\n".join(lines), spans_json
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -449,15 +533,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
 
     # Write JSON
+    print("Analyzing missing days ...", flush=True)
+    report, spans_json = compute_missing(hr, stress, sleep, args.tz)
     print("Writing dist/data.json ...", flush=True)
-    payload = json_payload(hr, stress, sleep)
+    payload = json_payload(hr, stress, sleep, spans_json)
     out_json = args.out / "data.json"
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
 
     # Write missing days to stdout
-    print("Analyzing missing days ...", flush=True)
-    report = missing_days_report(hr, stress, sleep, args.tz)
     if report:
         print(report)
     else:
