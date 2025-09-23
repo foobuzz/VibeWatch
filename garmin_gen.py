@@ -610,6 +610,7 @@ _DEFAULT_INDEX_HTML = """<!DOCTYPE html>
   <script src=\"https://cdn.jsdelivr.net/npm/luxon@3\"></script>
   <script src=\"https://cdn.jsdelivr.net/npm/chart.js@4\"></script>
   <script src=\"https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1\"></script>
+  <script src=\"https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2\"></script>
 </head>
 <body>
   <h1>Garmin Dashboard</h1>
@@ -622,11 +623,12 @@ _DEFAULT_INDEX_HTML = """<!DOCTYPE html>
     </div>
     <div class=\"controls\">
       <span>Bucket:</span>
-      <div class=\"seg\" id=\"bucket\">
+      <div class=\"seg\" id=\"bucket\"> 
         <button data-b=\"day\" class=\"active\">Day</button>
         <button data-b=\"week\">Week</button>
         <button data-b=\"month\">Month</button>
       </div>
+      <button id=\"resetRange\" title=\"Reset date range\">Reset</button>
     </div>
   </header>
   <div class=\"row\">
@@ -638,6 +640,7 @@ _DEFAULT_INDEX_HTML = """<!DOCTYPE html>
   <script>
     const TZ = 'Europe/Paris';
     const DateTime = luxon.DateTime;
+    if (window['chartjs-plugin-zoom']) Chart.register(window['chartjs-plugin-zoom']);
 
     function parseISOZ(s) { return DateTime.fromISO(s, { zone: 'utc' }); }
 
@@ -783,10 +786,23 @@ _DEFAULT_INDEX_HTML = """<!DOCTYPE html>
       ];
       const minTs = allTs.length ? DateTime.min(...allTs) : DateTime.now().minus({ months: 1 });
       const maxTs = allTs.length ? DateTime.max(...allTs) : DateTime.now();
-      document.getElementById('from').value = minTs.setZone(TZ).toFormat('yyyy-LL-dd');
-      document.getElementById('to').value = maxTs.setZone(TZ).toFormat('yyyy-LL-dd');
+      const defaultFrom = minTs.setZone(TZ).toFormat('yyyy-LL-dd');
+      const defaultTo = maxTs.setZone(TZ).toFormat('yyyy-LL-dd');
+      document.getElementById('from').value = defaultFrom;
+      document.getElementById('to').value = defaultTo;
 
       let bucket = 'day';
+
+      function onZoomApplied(chart) {
+        const scale = chart.scales.x;
+        if (!scale) return;
+        const from = DateTime.fromMillis(scale.min, { zone: TZ }).toFormat('yyyy-LL-dd');
+        const to = DateTime.fromMillis(scale.max, { zone: TZ }).toFormat('yyyy-LL-dd');
+        document.getElementById('from').value = from;
+        document.getElementById('to').value = to;
+        refresh();
+        setTimeout(() => { if (chart.resetZoom) chart.resetZoom(); }, 0);
+      }
 
       function refresh() {
         const from = document.getElementById('from').value || null;
@@ -807,6 +823,14 @@ _DEFAULT_INDEX_HTML = """<!DOCTYPE html>
         bucket = b;
         for (const btn of e.currentTarget.querySelectorAll('button')) btn.classList.toggle('active', btn.dataset.b === b);
         refresh();
+      });
+      document.getElementById('resetRange').addEventListener('click', () => {
+        document.getElementById('from').value = defaultFrom;
+        document.getElementById('to').value = defaultTo;
+        refresh();
+        if (sleepChart.resetZoom) sleepChart.resetZoom();
+        if (stressChart.resetZoom) stressChart.resetZoom();
+        if (hrChart.resetZoom) hrChart.resetZoom();
       });
 
       refresh();
