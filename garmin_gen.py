@@ -10,8 +10,15 @@ from typing import Dict, List, Optional, Tuple, Any
 
 try:
     from fitparse import FitFile
-except Exception as e:  # pragma: no cover
+except Exception:
     FitFile = None  # type: ignore
+
+try:
+    import fitdecode  # type: ignore
+    from fitdecode.records import FitDataMessage  # type: ignore
+except Exception:
+    fitdecode = None  # type: ignore
+    FitDataMessage = None  # type: ignore
 
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
@@ -39,13 +46,41 @@ def list_snapshot_dirs(root: Path) -> List[Path]:
     return snaps
 
 
-def load_fit(path: Path) -> Optional["FitFile"]:
-    if FitFile is None:
-        return None
-    try:
-        return FitFile(str(path))
-    except Exception:
-        return None
+def iter_fit_messages(path: Path):
+    """Yield (name, fields_dict) from a FIT file using available backends.
+
+    Tries fitparse first; if unavailable or fails, tries fitdecode.
+    """
+    # Backend 1: fitparse
+    if FitFile is not None:
+        try:
+            fit = FitFile(str(path))
+            for msg in fit.get_messages():
+                name = getattr(msg, "name", "") or ""
+                fields = {d.name: d.value for d in msg}
+                yield name, fields
+            return
+        except Exception:
+            pass
+    # Backend 2: fitdecode
+    if fitdecode is not None:
+        try:
+            with fitdecode.FitReader(str(path)) as fr:
+                for frame in fr:
+                    if isinstance(frame, FitDataMessage):
+                        name = frame.name or ""
+                        fields = {}
+                        for f in frame.fields:
+                            try:
+                                fields[f.name] = f.value
+                            except Exception:
+                                pass
+                        yield name, fields
+            return
+        except Exception:
+            pass
+    # If neither works, yield nothing
+    return
 
 
 def ensure_dt(dt: Any) -> Optional[datetime]:
@@ -57,27 +92,66 @@ def ensure_dt(dt: Any) -> Optional[datetime]:
     return None
 
 
-def extract_monitoring_metrics(fit: "FitFile") -> Tuple[List[Tuple[datetime, int]], List[Tuple[datetime, int]]]:
+def _reconstruct_ts16(last_full: Optional[datetime], ts16_val: Any) -> Optional[datetime]:
+    # If ts16 is already datetime, use it
+    if isinstance(ts16_val, datetime):
+        return ensure_dt(ts16_val)
+    if last_full is None:
+        return None
+    try:
+        ts16 = int(ts16_val) & 0xFFFF
+    except Exception:
+        return None
+    base = int(last_full.replace(tzinfo=timezone.utc).timestamp())
+    candidate = (base & ~0xFFFF) | ts16
+    # Adjust for wrap to be closest to base
+    if candidate < base - 0x8000:
+        candidate += 0x10000
+    elif candidate > base + 0x8000:
+        candidate -= 0x10000
+    return datetime.fromtimestamp(candidate, tz=timezone.utc)
+
+
+def extract_monitoring_metrics_from_iter(messages) -> Tuple[List[Tuple[datetime, int]], List[Tuple[datetime, int]]]:
     """Return (hr_samples, stress_samples) as lists of (utc_dt, value)."""
     hr: List[Tuple[datetime, int]] = []
     stress: List[Tuple[datetime, int]] = []
+    last_full_ts: Optional[datetime] = None
     try:
-        for msg in fit.get_messages():
-            name = getattr(msg, "name", "") or ""
-            if name not in ("monitoring", "stress", "monitoring_info", "record"):
+        for name, fields in messages:
+            # Track base timestamp when present
+            base_ts = ensure_dt(fields.get("timestamp"))
+            if base_ts is not None:
+                last_full_ts = base_ts
+
+            if name in ("monitoring", "record", "monitoring_a"):
+                # HR may come with only timestamp_16
+                ts = base_ts
+                if ts is None:
+                    ts16 = fields.get("timestamp_16")
+                    if ts16 is not None:
+                        ts = _reconstruct_ts16(last_full_ts, ts16)
+                hr_val = fields.get("heart_rate")
+                if ts is not None and isinstance(hr_val, int) and hr_val > 0:
+                    hr.append((ts, hr_val))
+
+            # Stress can be in dedicated message with its own time
+            if name == "stress_level":
+                s_ts = ensure_dt(fields.get("stress_level_time"))
+                s_val = fields.get("stress_level_value")
+                if s_ts is not None and isinstance(s_val, int) and s_val >= 0:
+                    stress.append((s_ts, s_val))
                 continue
-            fields = {d.name: d.value for d in msg}
-            ts = ensure_dt(fields.get("timestamp"))
-            if ts is None:
-                continue
-            # Heart rate can be on monitoring or record
-            hr_val = fields.get("heart_rate")
-            if isinstance(hr_val, int) and hr_val > 0:
-                hr.append((ts, hr_val))
-            # Stress can be on stress/monitoring messages
+
+            # Or come as field on other messages
             for key in ("stress_level", "stress", "stress_level_value"):
                 v = fields.get(key)
-                if isinstance(v, int) and v >= 0:
+                ts = base_ts
+                if ts is None:
+                    ts16 = fields.get("timestamp_16")
+                    if ts16 is not None:
+                        ts = _reconstruct_ts16(last_full_ts, ts16)
+                if ts is not None and isinstance(v, int) and v >= 0:
                     stress.append((ts, v))
                     break
     except Exception:
@@ -85,7 +159,7 @@ def extract_monitoring_metrics(fit: "FitFile") -> Tuple[List[Tuple[datetime, int
     return hr, stress
 
 
-def extract_sleep_sessions(fit: "FitFile") -> List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]:
+def extract_sleep_sessions_from_iter(messages) -> List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]]:
     """Return list of sleep sessions as (start_utc, end_utc, duration_sec).
 
     Tries multiple heuristics since FIT sleep schemas vary by device/firmware.
@@ -95,9 +169,8 @@ def extract_sleep_sessions(fit: "FitFile") -> List[Tuple[Optional[datetime], Opt
     starts: List[datetime] = []
     ends: List[datetime] = []
     try:
-        for msg in fit.get_messages():
-            name = getattr(msg, "name", "") or ""
-            fields = {d.name: d.value for d in msg}
+        timeline: List[Tuple[datetime, int]] = []
+        for name, fields in messages:
             # Common summary message
             if name in ("sleep_summary", "sleep"):
                 dur = fields.get("total_sleep_time") or fields.get("total_sleep_duration") or fields.get("sleep_time")
@@ -109,6 +182,12 @@ def extract_sleep_sessions(fit: "FitFile") -> List[Tuple[Optional[datetime], Opt
                     starts.append(st)
                 if en is not None:
                     ends.append(en)
+            # Sleep level timeline (derive sessions)
+            if name == "sleep_level":
+                ts = ensure_dt(fields.get("timestamp"))
+                lvl = fields.get("sleep_level")
+                if ts is not None and isinstance(lvl, int):
+                    timeline.append((ts, lvl))
             # Some devices expose intervals with duration
             for dur_key in ("duration", "total_sleep", "light_sleep_time", "deep_sleep_time", "rem_sleep_time"):
                 v = fields.get(dur_key)
@@ -123,6 +202,37 @@ def extract_sleep_sessions(fit: "FitFile") -> List[Tuple[Optional[datetime], Opt
                 en = ensure_dt(fields.get(en_key))
                 if en is not None:
                     ends.append(en)
+
+        # Derive sessions from timeline: consider levels > 1 as sleeping
+        if timeline:
+            timeline.sort(key=lambda x: x[0])
+            in_sleep = False
+            cur_start: Optional[datetime] = None
+            last_ts: Optional[datetime] = None
+            last_lvl: Optional[int] = None
+            for ts, lvl in timeline:
+                if in_sleep:
+                    # If we were sleeping and a long gap occurs, close session
+                    if last_ts and (ts - last_ts).total_seconds() > 60 * 30:  # 30+ min gap ends session
+                        if cur_start and last_ts and last_ts > cur_start:
+                            sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
+                        in_sleep = False
+                        cur_start = None
+                if lvl and lvl > 1:
+                    if not in_sleep:
+                        in_sleep = True
+                        cur_start = ts
+                else:
+                    if in_sleep:
+                        # end of sleep
+                        if cur_start and last_ts and last_ts > cur_start:
+                            sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
+                        in_sleep = False
+                        cur_start = None
+                last_ts, last_lvl = ts, lvl
+            # Close trailing session
+            if in_sleep and cur_start and last_ts and last_ts > cur_start:
+                sessions.append((cur_start, last_ts, int((last_ts - cur_start).total_seconds())))
     except Exception:
         pass
 
@@ -153,10 +263,8 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
             if limit:
                 files = files[:limit]
             for f in files:
-                fit = load_fit(f)
-                if fit is None:
-                    continue
-                hr, st = extract_monitoring_metrics(fit)
+                msgs = iter_fit_messages(f)
+                hr, st = extract_monitoring_metrics_from_iter(msgs)
                 hr_all.extend(hr)
                 stress_all.extend(st)
 
@@ -167,10 +275,8 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
             if limit:
                 files = files[:limit]
             for f in files:
-                fit = load_fit(f)
-                if fit is None:
-                    continue
-                sleep_all.extend(extract_sleep_sessions(fit))
+                msgs = iter_fit_messages(f)
+                sleep_all.extend(extract_sleep_sessions_from_iter(msgs))
 
         # Metrics → sometimes contains sleep summary and stress
         met_dir = snap / "Metrics"
@@ -179,12 +285,12 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
             if limit:
                 files = files[:limit]
             for f in files:
-                fit = load_fit(f)
-                if fit is None:
-                    continue
+                msgs = iter_fit_messages(f)
                 # Try extracting additional sleep durations
-                sleep_all.extend(extract_sleep_sessions(fit))
-                hr, st = extract_monitoring_metrics(fit)
+                sleep_all.extend(extract_sleep_sessions_from_iter(msgs))
+                # Re-iterate for hr/stress because generator consumed
+                msgs2 = iter_fit_messages(f)
+                hr, st = extract_monitoring_metrics_from_iter(msgs2)
                 # Some metrics files may have resting HR; we ignore resting HR explicitly
                 # and only keep samples where message contained instantaneous HR
                 hr_all.extend(hr)
@@ -568,4 +674,3 @@ _DEFAULT_INDEX_HTML = """<!DOCTYPE html>
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
