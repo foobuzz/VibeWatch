@@ -255,14 +255,26 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
     sleep_all: List[Tuple[Optional[datetime], Optional[datetime], Optional[int]]] = []
 
     snaps = list_snapshot_dirs(root)
+    print(f"Found {len(snaps)} snapshot(s) in {root}", flush=True)
     for snap in snaps:
+        print(f"Snapshot {snap.name}", flush=True)
+        def iter_with_progress(files: List[Path], label: str):
+            total = len(files)
+            if total == 0:
+                return
+            print(f"  {label}: {total} file(s){' (limited)' if limit and total>limit else ''}", flush=True)
+            step = max(total // 10, 1)
+            for i, f in enumerate(files, start=1):
+                yield i, total, f
+                if i % step == 0 or i == total:
+                    print(f"  {label}: {i}/{total}", flush=True)
         # Monitor → HR & stress
         mon_dir = snap / "Monitor"
         if mon_dir.exists():
             files = sorted([p for p in mon_dir.iterdir() if p.suffix.lower() == ".fit"])
             if limit:
                 files = files[:limit]
-            for f in files:
+            for i, total, f in iter_with_progress(files, "Monitor"):
                 msgs = iter_fit_messages(f)
                 hr, st = extract_monitoring_metrics_from_iter(msgs)
                 hr_all.extend(hr)
@@ -274,7 +286,7 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
             files = sorted([p for p in sl_dir.iterdir() if p.suffix.lower() == ".fit"])
             if limit:
                 files = files[:limit]
-            for f in files:
+            for i, total, f in iter_with_progress(files, "Sleep"):
                 msgs = iter_fit_messages(f)
                 sleep_all.extend(extract_sleep_sessions_from_iter(msgs))
 
@@ -284,7 +296,7 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
             files = sorted([p for p in met_dir.iterdir() if p.suffix.lower() == ".fit"])
             if limit:
                 files = files[:limit]
-            for f in files:
+            for i, total, f in iter_with_progress(files, "Metrics"):
                 msgs = iter_fit_messages(f)
                 # Try extracting additional sleep durations
                 sleep_all.extend(extract_sleep_sessions_from_iter(msgs))
@@ -295,6 +307,7 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
                 # and only keep samples where message contained instantaneous HR
                 hr_all.extend(hr)
                 stress_all.extend(st)
+        print(f"  Done {snap.name}", flush=True)
 
     # Deduplicate by timestamp for hr and stress
     def dedup_time_series(series: List[Tuple[datetime, int]]) -> List[Tuple[datetime, int]]:
@@ -318,6 +331,7 @@ def parse_snapshots(root: Path, limit: int = 0) -> Tuple[List[Tuple[datetime, in
             continue
         seen_sigs.add(sig)
         merged_sleep.append((st, en, dur))
+    print(f"Parsed: HR samples={len(hr_all)}, Stress samples={len(stress_all)}, Sleep sessions={len(merged_sleep)}", flush=True)
     return hr_all, stress_all, merged_sleep
 
 
@@ -435,12 +449,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
 
     # Write JSON
+    print("Writing dist/data.json ...", flush=True)
     payload = json_payload(hr, stress, sleep)
     out_json = args.out / "data.json"
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
 
     # Write missing days to stdout
+    print("Analyzing missing days ...", flush=True)
     report = missing_days_report(hr, stress, sleep, args.tz)
     if report:
         print(report)
