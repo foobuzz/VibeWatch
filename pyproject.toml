@@ -1,0 +1,13 @@
+[project]
+name = "garmin-importer"
+version = "0.1.0"
+description = "Static site generator to aggregate Garmin watch snapshots into a dashboard JSON and HTML."
+readme = "task.md"
+requires-python = ">=3.9"
+dependencies = [
+  "fitparse>=1.2.0",
+]
+
+[project.scripts]
+garmin-gen = "garmin_gen:main"
+
