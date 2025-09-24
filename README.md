@@ -2,6 +2,8 @@
 
 If like me you don't want to connect your Garmin to your phone to avoid data collection (allegedly anonymous), then this project is for you: Dashboards from raw data transferred from your watch to your computer via USB. Dashboards are implemented for sleep, stress, and BPM.
 
+<video src="https://github.com/foobuzz/VibeWatch/raw/refs/heads/main/output.mp4" width="352" height="720"></video>
+
 🤖 **Vibe Coding notice**
 
 This is entirely vibe coded by Codex CLI (hence the name). And I did not review the code in any depth.
