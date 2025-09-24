@@ -2,7 +2,7 @@
 
 If like me you don't want to connect your Garmin to your phone to avoid data collection (allegedly anonymous), then this project is for you: Dashboards from raw data transferred from your watch to your computer via USB. Dashboards are implemented for sleep, stress, and BPM.
 
-👇 this is fake data
+👇 this demo video uses fake data
 
 <video src="https://github.com/user-attachments/assets/0a3b6196-2324-4677-8892-961820d35330" width="352" height="720"></video>
 
